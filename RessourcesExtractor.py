@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VMF Dependency Exporter & Traceability Tool (GMod / Source SDK 2013)
+VMF Dependency Exporter & Traceability Tool (GMod / Source SDK 2013) - v3.2
 ===========================================================================
 
 Exporte les dépendances d'un VMF avec traçabilité complète, recherche intelligente
-de secours pour les dossiers manquants/déplacés, scan VPK et extraction Lua/Soundscapes.
+de secours pour les dossiers manquants/déplacés, scan VPK, extraction Lua/Soundscapes,
+résolution multithreadée et rapport en couleur.
 """
 
 import os
 import re
 import sys
+import time
 import shutil
 import argparse
 import struct
 import csv
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import deque, defaultdict
 
@@ -44,26 +48,82 @@ BUILTIN_TEXTURES = {
 PATH_CHARS_RE = re.compile(r'^[A-Za-z0-9_\-./\\ ]{2,90}$')
 
 # ----------------------------------------------------------------------------
+# Présentation terminal "vintage" en couleurs (ANSI). Se désactive proprement
+# si le terminal ne les supporte pas (sortie redirigée vers un fichier, etc.)
+# ou si NO_COLOR est défini dans l'environnement.
+# ----------------------------------------------------------------------------
+if sys.platform == "win32":
+    os.system("")  # active le rendu ANSI/VT100 dans cmd.exe / PowerShell (Windows 10+)
+
+def _supports_color():
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    try:
+        return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    except Exception:
+        return False
+
+class C:
+    ON = _supports_color()
+    RESET = "\033[0m" if ON else ""
+    BOLD = "\033[1m" if ON else ""
+    DIM = "\033[2m" if ON else ""
+    GREEN = "\033[38;5;114m" if ON else ""
+    AMBER = "\033[38;5;179m" if ON else ""
+    CYAN = "\033[38;5;80m" if ON else ""
+    RED = "\033[38;5;203m" if ON else ""
+    MAGENTA = "\033[38;5;140m" if ON else ""
+    GREY = "\033[38;5;244m" if ON else ""
+
+def cprint(text, color="", bold=False, end="\n"):
+    prefix = (C.BOLD if bold else "") + color
+    sys.stdout.write(f"{prefix}{text}{C.RESET}{end}")
+    sys.stdout.flush()
+
+def print_banner(threads):
+    bar = "═" * 63
+    lines = [
+        f"{C.CYAN}╔{bar}╗{C.RESET}",
+        f"{C.CYAN}║{C.RESET}{C.BOLD}{C.AMBER}{'V M F   R E S O U R C E   E X T R A C T O R':^62}{C.RESET}{C.CYAN} ║{C.RESET}",
+        f"{C.CYAN}║{C.RESET}{C.GREY}{'-- traçabilité, VPK, lua & sprites -- GMod / Source SDK 2013 --':^62}{C.RESET}{C.CYAN}║{C.RESET}",
+        f"{C.CYAN}╚{bar}╝{C.RESET}",
+        f"{C.GREY}   threads: {threads}   {time.strftime('%Y-%m-%d %H:%M:%S')}{C.RESET}",
+    ]
+    print("\n".join(lines))
+
+# ----------------------------------------------------------------------------
 # Traçabilité (Provenance)
 # ----------------------------------------------------------------------------
 class ProvenanceTracker:
     def __init__(self):
         self.data = defaultdict(set)
+        self._lock = threading.Lock()
 
     def add(self, category, item, source_info):
         if item:
             key = (category, item.lower().strip("/"))
-            self.data[key].add(source_info)
+            with self._lock:
+                self.data[key].add(source_info)
 
     def get_sources(self, category, item):
         key = (category, item.lower().strip("/"))
-        sources = self.data.get(key, set())
+        with self._lock:
+            sources = set(self.data.get(key, set()))
         return " | ".join(sorted(sources)) if sources else "Origine inconnue"
 
 # ----------------------------------------------------------------------------
 # Parseur VPK avec Recherche Intelligente
 # ----------------------------------------------------------------------------
 class VPKFS:
+    """Index des fichiers présents dans les VPK (jeu de base + jeux montés).
+
+    On ne fait QUE de la détection de présence, jamais de copie/extraction :
+    ce contenu (CS:S, HL2, TF2, autres addons en .vpk...) est déjà présent
+    chez tout joueur possédant ces jeux/addons montés, donc pas besoin de le
+    repacker dans l'addon. Le rôle de cette classe est uniquement d'éviter
+    de classer à tort en "TRULY MISSING" une ressource qui est en fait tout
+    à fait disponible côté jeu.
+    """
     def __init__(self):
         self.entries = {}  # relpath (lower) -> dict(dir_vpk, header_size, tree_size, archive_index, entry_offset, entry_length, preload)
         self.by_filename = defaultdict(list)
@@ -106,7 +166,7 @@ class VPKFS:
 
         vpk_files = list(set(vpk_files))
         for vpk in vpk_files: self._index_vpk(vpk)
-        print(f"  -> VPK Scanner : {len(vpk_files)} VPKs analysés ({len(self.entries)} fichiers uniques indexés)")
+        print(f"{C.GREY}  -> VPK Scanner : {len(vpk_files)} VPKs analysés ({len(self.entries)} fichiers uniques indexés){C.RESET}")
 
     def _index_vpk(self, dir_vpk_path):
         try:
@@ -219,7 +279,7 @@ class GameFS:
                     self.index[rel_clean] = full
                     self.by_filename[fn.lower()].append((rel_clean, full))
                     count += 1
-        print(f"  -> {subdir} (disque, y compris addons/*/{subdir}) : {count} fichiers indexés")
+        print(f"{C.GREY}  -> {subdir} (disque, y compris addons/*/{subdir}) : {count} fichiers indexés{C.RESET}")
 
     def resolve(self, relpath):
         return self.index.get(relpath.replace("\\", "/").lower())
@@ -264,6 +324,27 @@ class GameFS:
             return best_cand[1], best_cand[0], f"Redirigé par correspondance approximative : demandé '{clean_rel}', trouvé '{best_cand[0]}'"
 
         return None, None, None
+
+    def find_by_stem_in_dirs(self, stem, dir_prefixes, exclude_addons=True):
+        """Recherche floue par ressemblance de nom (pas de correspondance exacte
+        exigée), restreinte à une liste de dossiers. Sert au lua "deviné" lié au
+        nom de la map : rien dans le VMF n'impose son nom exact, donc on cherche
+        par proximité. exclude_addons=True pour ne JAMAIS chercher sous addons/
+        (sur demande explicite : ces scripts-là sont censés être dans le jeu de
+        base, pas dans un addon tiers)."""
+        stem_norm = re.sub(r'[^a-z0-9]', '', stem.lower())
+        if not stem_norm: return []
+        results = []
+        for rel, path in self.index.items():
+            if exclude_addons and rel.startswith("addons/"):
+                continue
+            if dir_prefixes and not any(rel.startswith(p) for p in dir_prefixes):
+                continue
+            name_norm = re.sub(r'[^a-z0-9]', '', Path(rel).stem.lower())
+            if not name_norm: continue
+            if stem_norm == name_norm or stem_norm in name_norm or name_norm in stem_norm:
+                results.append((rel, path))
+        return results
 
 # ----------------------------------------------------------------------------
 # Normalisation des chemins
@@ -434,15 +515,10 @@ def parse_vmf_detailed(vmf_text, vmf_stem, tracker):
                 lp = norm_lua(m_lua.group(1))
                 lua_scripts.add(lp); tracker.add("lua", lp, source_info)
 
-    map_lua_candidates = [
-        f"maps/{vmf_stem}.lua",
-        f"lua/autorun/{vmf_stem}.lua",
-        f"lua/autorun/client/{vmf_stem}.lua",
-        f"lua/autorun/server/{vmf_stem}.lua"
-    ]
-    for cand in map_lua_candidates:
-        lua_scripts.add(cand)
-        tracker.add("lua", cand, "Script automatique lié à la map")
+    # Note : le lua "deviné" lié au nom de la map (autorun/*.lua portant un nom
+    # proche du .vmf) n'est PAS ajouté ici -- rien dans le VMF ne garantit son
+    # nom exact, donc une recherche floue est faite séparément dans resolve_all,
+    # restreinte au jeu de base (jamais sous addons/).
 
     return {
         "materials": materials, "models": models, "sounds": sounds,
@@ -596,7 +672,7 @@ def find_model_companions(mdl_actual_path):
 # ----------------------------------------------------------------------------
 # Résolution Globale
 # ----------------------------------------------------------------------------
-def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs):
+def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs, threads=1, progress=True):
     tracker = ProvenanceTracker()
     base = parse_vmf_detailed(vmf_text, vmf_stem, tracker)
 
@@ -619,45 +695,83 @@ def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs):
     model_companions = {}
     pending_textures = set()
 
-    # --- MATERIALS & MODELS ---
-    while materials_q or models_q:
-        while materials_q:
-            mat = materials_q.popleft()
-            if not mat or mat in processed_materials or is_excluded_material(mat): continue
-            processed_materials.add(mat)
+    n_workers = max(1, int(threads or 1))
+    executor = ThreadPoolExecutor(max_workers=n_workers) if n_workers > 1 else None
 
-            rel_vmt = f"materials/{mat}.vmt" if not mat.lower().endswith(".spr") else f"materials/{mat}"
-            actual, res_rel, note = fs.resolve_smart(rel_vmt, "materials/")
+    # -- fonctions "pures" : ne lisent que fs/vpk_fs (lecture seule, donc
+    # thread-safe), n'écrivent nulle part -- tout le merge dans les sets/
+    # tracker partagés se fait ensuite dans le thread principal uniquement.
+    def _resolve_material(mat):
+        rel_vmt = f"materials/{mat}.vmt" if not mat.lower().endswith(".spr") else f"materials/{mat}"
+        actual, res_rel, note = fs.resolve_smart(rel_vmt, "materials/")
+        in_vpk, vpk_rel, vpk_note = (False, None, None)
+        texs, nested = set(), set()
+        if actual:
+            if res_rel.endswith(".vmt"):
+                clean_mat_name = res_rel[len("materials/"): -4]
+                texs, nested = parse_vmt(actual, clean_mat_name, tracker, fs, vpk_fs)
+        else:
             in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(rel_vmt, "materials/")
+        return mat, actual, res_rel, note, in_vpk, vpk_rel, vpk_note, texs, nested
 
+    def _resolve_model(mdl):
+        actual, res_rel, note = fs.resolve_smart(mdl, "models/")
+        in_vpk, vpk_rel, vpk_note = (False, None, None)
+        mats_found, companions = set(), []
+        if actual:
+            companions = find_model_companions(actual)
+            mats_found = guess_model_materials(actual, mdl, fs, vpk_fs, tracker)
+        else:
+            in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(mdl, "models/")
+        return mdl, actual, res_rel, note, in_vpk, vpk_rel, vpk_note, mats_found, companions
+
+    # --- MATERIALS & MODELS (BFS par vagues, chaque vague traitée en //) ---
+    round_no = 0
+    while materials_q or models_q:
+        round_no += 1
+        mat_batch = []
+        while materials_q:
+            m = materials_q.popleft()
+            if not m or m in processed_materials or is_excluded_material(m): continue
+            processed_materials.add(m)
+            mat_batch.append(m)
+
+        mdl_batch = []
+        while models_q:
+            d = models_q.popleft()
+            if not d or d in processed_models: continue
+            processed_models.add(d)
+            mdl_batch.append(d)
+
+        if not mat_batch and not mdl_batch:
+            break
+
+        if executor and (len(mat_batch) + len(mdl_batch) > 1):
+            mat_results = list(executor.map(_resolve_material, mat_batch)) if mat_batch else []
+            mdl_results = list(executor.map(_resolve_model, mdl_batch)) if mdl_batch else []
+        else:
+            mat_results = [_resolve_material(m) for m in mat_batch]
+            mdl_results = [_resolve_model(d) for d in mdl_batch]
+
+        for mat, actual, res_rel, note, in_vpk, vpk_rel, vpk_note, texs, nested in mat_results:
             if actual:
                 local_materials.add(res_rel)
                 if note: tracker.add("material", mat, f"[Auto-Fix] {note}")
-                if res_rel.endswith(".vmt"):
-                    clean_mat_name = res_rel[len("materials/"): -4]
-                    texs, nested = parse_vmt(actual, clean_mat_name, tracker, fs, vpk_fs)
-                    pending_textures.update(texs)
-                    for n in nested:
-                        if n not in processed_materials: materials_q.append(n)
+                pending_textures.update(texs)
+                for n in nested:
+                    if n not in processed_materials: materials_q.append(n)
             elif in_vpk:
                 vpk_materials.add(vpk_rel)
                 if vpk_note: tracker.add("material", mat, f"[Auto-Fix] {vpk_note}")
             else:
                 missing_materials.add(mat)
 
-        while models_q:
-            mdl = models_q.popleft()
-            if not mdl or mdl in processed_models: continue
-            processed_models.add(mdl)
-
-            actual, res_rel, note = fs.resolve_smart(mdl, "models/")
-            in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(mdl, "models/")
-
+        for mdl, actual, res_rel, note, in_vpk, vpk_rel, vpk_note, mats_found, companions in mdl_results:
             if actual:
                 local_models.add(res_rel)
                 if note: tracker.add("model", mdl, f"[Auto-Fix] {note}")
-                model_companions[res_rel] = find_model_companions(actual)
-                for mat in guess_model_materials(actual, mdl, fs, vpk_fs, tracker):
+                model_companions[res_rel] = companions
+                for mat in mats_found:
                     if mat not in processed_materials and not is_excluded_material(mat):
                         materials_q.append(mat)
             elif in_vpk:
@@ -666,44 +780,58 @@ def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs):
             else:
                 missing_models.add(mdl)
 
-    # --- TEXTURES ---
-    for tex in pending_textures:
-        if not tex: continue
-        rel_vtf = f"materials/{tex}.vtf"
-        actual, res_rel, note = fs.resolve_smart(rel_vtf, "materials/")
-        in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(rel_vtf, "materials/")
+        if progress:
+            done = len(processed_materials) + len(processed_models)
+            left = len(materials_q) + len(models_q)
+            cprint(f"  Vague {round_no} : {done} traités ({len(processed_materials)} materials / {len(processed_models)} models) | {left} en attente pour la vague suivante   ", C.DIM, end="\r")
 
+    if progress:
+        print()  # newline final après les vagues (\r utilisé pendant la boucle)
+
+    # --- Fonction générique pour les catégories "à plat" (pas de récursion) ---
+    def _resolve_flat(item, dir_prefix=""):
+        actual, res_rel, note = fs.resolve_smart(item, dir_prefix)
+        in_vpk, vpk_rel, vpk_note = (False, None, None)
+        if not actual:
+            in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(item, dir_prefix)
+        return item, actual, res_rel, note, in_vpk, vpk_rel, vpk_note
+
+    def _run_flat_batch(items, dir_prefix=""):
+        items = [i for i in items if i]
+        if not items:
+            return []
+        if executor and len(items) > 1:
+            return list(executor.map(lambda i: _resolve_flat(i, dir_prefix), items))
+        return [_resolve_flat(i, dir_prefix) for i in items]
+
+    # --- TEXTURES ---
+    for tex, actual, res_rel, note, in_vpk, vpk_rel, vpk_note in _run_flat_batch(
+            [f"materials/{t}.vtf" for t in pending_textures if t], "materials/"):
+        tex_clean = norm_texture(tex)
         if actual:
             local_textures.add(res_rel)
-            if note: tracker.add("texture", tex, f"[Auto-Fix] {note}")
+            if note: tracker.add("texture", tex_clean, f"[Auto-Fix] {note}")
         elif in_vpk:
             vpk_textures.add(vpk_rel)
-            if vpk_note: tracker.add("texture", tex, f"[Auto-Fix] {vpk_note}")
+            if vpk_note: tracker.add("texture", tex_clean, f"[Auto-Fix] {vpk_note}")
         else:
-            missing_textures.add(tex)
+            missing_textures.add(tex_clean)
 
     # --- SOUNDS ---
-    for snd in raw_sounds:
-        if not snd: continue
-        rel_snd = f"sound/{snd}"
-        actual, res_rel, note = fs.resolve_smart(rel_snd, "sound/")
-        in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(rel_snd, "sound/")
-
+    for snd, actual, res_rel, note, in_vpk, vpk_rel, vpk_note in _run_flat_batch(
+            [f"sound/{s}" for s in raw_sounds if s], "sound/"):
+        snd_clean = norm_sound(snd)
         if actual:
             local_sounds.add(res_rel)
-            if note: tracker.add("sound", snd, f"[Auto-Fix] {note}")
+            if note: tracker.add("sound", snd_clean, f"[Auto-Fix] {note}")
         elif in_vpk:
             vpk_sounds.add(vpk_rel)
-            if vpk_note: tracker.add("sound", snd, f"[Auto-Fix] {vpk_note}")
+            if vpk_note: tracker.add("sound", snd_clean, f"[Auto-Fix] {vpk_note}")
         else:
-            missing_sounds.add(snd)
+            missing_sounds.add(snd_clean)
 
-    # --- LUA SCRIPTS ---
-    for lua in base["lua_scripts"]:
-        if not lua: continue
-        actual, res_rel, note = fs.resolve_smart(lua)
-        in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(lua)
-
+    # --- LUA SCRIPTS (références explicites trouvées dans le VMF) ---
+    for lua, actual, res_rel, note, in_vpk, vpk_rel, vpk_note in _run_flat_batch(base["lua_scripts"]):
         if actual:
             local_lua.add(res_rel)
             if note: tracker.add("lua", lua, f"[Auto-Fix] {note}")
@@ -714,11 +842,19 @@ def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs):
             if not lua.startswith("maps/"):
                 missing_lua.add(lua)
 
-    # --- SOUNDSCAPE TXT FILES ---
-    for txt in ss_txt_files:
-        actual, res_rel, note = fs.resolve_smart(txt)
-        in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(txt)
+    # --- LUA "DEVINÉ" LIÉ AU NOM DE LA MAP ---
+    # Rien dans le VMF n'impose le nom exact de ce script (si il existe), donc
+    # recherche par ressemblance de nom plutôt que correspondance exacte.
+    # UNIQUEMENT dans le jeu de base : jamais sous addons/ (demande explicite).
+    guess_dirs = ["maps/", "lua/autorun/", "lua/autorun/client/", "lua/autorun/server/"]
+    for rel, _path in fs.find_by_stem_in_dirs(vmf_stem, guess_dirs, exclude_addons=True):
+        local_lua.add(rel)
+        tracker.add("lua", rel, "Script probablement lié à la map (nom proche), jeu de base uniquement")
+    # Pas d'ajout à missing_lua ici : ce n'était qu'une supposition, pas une
+    # dépendance confirmée par le VMF -- l'absence de résultat n'est pas une erreur.
 
+    # --- SOUNDSCAPE TXT FILES ---
+    for txt, actual, res_rel, note, in_vpk, vpk_rel, vpk_note in _run_flat_batch(ss_txt_files):
         if actual:
             local_txt.add(res_rel)
             if note: tracker.add("script_txt", txt, f"[Auto-Fix] {note}")
@@ -729,11 +865,7 @@ def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs):
             missing_txt.add(txt)
 
     # --- SPRITES LEGACY (.spr, dossier sprites/ à la racine) ---
-    for spr in base["legacy_sprites"]:
-        if not spr: continue
-        actual, res_rel, note = fs.resolve_smart(spr, "sprites/")
-        in_vpk, vpk_rel, vpk_note = vpk_fs.contains_smart(spr, "sprites/")
-
+    for spr, actual, res_rel, note, in_vpk, vpk_rel, vpk_note in _run_flat_batch(base["legacy_sprites"], "sprites/"):
         if actual:
             local_sprites.add(res_rel)
             if note: tracker.add("sprite", spr, f"[Auto-Fix] {note}")
@@ -742,6 +874,9 @@ def resolve_all(vmf_text, vmf_stem, gameSrc, fs, vpk_fs):
             if vpk_note: tracker.add("sprite", spr, f"[Auto-Fix] {vpk_note}")
         else:
             missing_sprites.add(spr)
+
+    if executor:
+        executor.shutdown(wait=True)
 
     return {
         "materials": local_materials, "vpk_materials": vpk_materials, "missing_materials": missing_materials,
@@ -766,28 +901,49 @@ def copy_file(src, dest):
         print(f"Erreur de copie pour {src}: {e}")
         return False
 
+def _line_color(missing_count):
+    return C.RED if missing_count > 0 else C.GREEN
+
 def build_report(data):
-    lines = [
-        "\n===== Rapport d'export & Diagnostic VPK =====",
-        f"Materials   : {len(data['materials']):>4} à copier | {len(data['vpk_materials']):>4} en VPK | {len(data['missing_materials']):>4} TRULY MISSING",
-        f"Textures    : {len(data['textures']):>4} à copier | {len(data['vpk_textures']):>4} en VPK | {len(data['missing_textures']):>4} TRULY MISSING",
-        f"Models      : {len(data['models']):>4} à copier | {len(data['vpk_models']):>4} en VPK | {len(data['missing_models']):>4} TRULY MISSING",
-        f"Sons        : {len(data['sounds']):>4} à copier | {len(data['vpk_sounds']):>4} en VPK | {len(data['missing_sounds']):>4} TRULY MISSING",
-        f"Sprites .spr: {len(data['sprites']):>4} à copier | {len(data['vpk_sprites']):>4} en VPK | {len(data['missing_sprites']):>4} TRULY MISSING",
-        f"Scripts Lua : {len(data['lua']):>4} à copier | {len(data['vpk_lua']):>4} en VPK | {len(data['missing_lua']):>4} TRULY MISSING",
-        f"Soundscapes : {len(data['txt']):>4} à copier | {len(data['vpk_txt']):>4} en VPK | {len(data['missing_txt']):>4} TRULY MISSING",
-        "=============================================\n"
+    rows = [
+        ("Materials   ", "materials", "vpk_materials", "missing_materials"),
+        ("Textures    ", "textures", "vpk_textures", "missing_textures"),
+        ("Models      ", "models", "vpk_models", "missing_models"),
+        ("Sons        ", "sounds", "vpk_sounds", "missing_sounds"),
+        ("Sprites .spr", "sprites", "vpk_sprites", "missing_sprites"),
+        ("Scripts Lua ", "lua", "vpk_lua", "missing_lua"),
+        ("Soundscapes ", "txt", "vpk_txt", "missing_txt"),
     ]
+    bar = "─" * 62
+    lines = [f"\n{C.CYAN}┌{bar}┐{C.RESET}",
+             f"{C.CYAN}│{C.RESET}{C.BOLD}{' RAPPORT D’EXPORT & DIAGNOSTIC VPK':^62}{C.RESET}{C.CYAN}│{C.RESET}",
+             f"{C.CYAN}├{bar}┤{C.RESET}"]
+    for label, local_k, vpk_k, miss_k in rows:
+        n_local, n_vpk, n_miss = len(data[local_k]), len(data[vpk_k]), len(data[miss_k])
+        miss_col = _line_color(n_miss)
+        line = (f"{label} : {C.GREEN}{n_local:>4} à copier{C.RESET} | "
+                f"{C.AMBER}{n_vpk:>4} en VPK{C.RESET} | "
+                f"{miss_col}{n_miss:>4} TRULY MISSING{C.RESET}")
+        lines.append(f"{C.CYAN}│{C.RESET} {line}")
+    lines.append(f"{C.CYAN}└{bar}┘{C.RESET}\n")
     return "\n".join(lines)
 
 def export_all(data, gameSrc, dest, fs):
     base, dest = Path(gameSrc), Path(dest)
+    total = sum(len(data[c]) for c in ("materials", "textures", "models", "sounds", "lua", "txt", "sprites"))
+    done, failed = 0, 0
 
     for cat in ("materials", "textures", "models", "sounds", "lua", "txt", "sprites"):
         for rel_path in data[cat]:
             actual = fs.resolve(rel_path)
+            done += 1
             if actual:
-                copy_file(actual, dest / rel_path)
+                if not copy_file(actual, dest / rel_path):
+                    failed += 1
+            else:
+                failed += 1
+            if done % 200 == 0 or done == total:
+                cprint(f"  Copie... {done}/{total}", C.DIM, end="\r")
 
     for mdl_rel, companions in data["model_companions"].items():
         for comp in companions:
@@ -796,9 +952,12 @@ def export_all(data, gameSrc, dest, fs):
                 copy_file(comp, dest / rel)
             except ValueError: pass
 
+    print()
+    return failed
+
 def print_missing_details(data):
     tracker = data["tracker"]
-    print("\n--- DÉTAIL DES RESSOURCES TOTALEMENT MANQUANTES (TRULY MISSING) ET LEUR PROVENANCE ---")
+    cprint("\n--- DÉTAIL DES RESSOURCES TOTALEMENT MANQUANTES (TRULY MISSING) ET LEUR PROVENANCE ---", C.RED, bold=True)
     mapping = [
         ("missing_materials", "material"), ("missing_textures", "texture"),
         ("missing_models", "model"), ("missing_sounds", "sound"),
@@ -808,7 +967,8 @@ def print_missing_details(data):
     for cat_key, item_type in mapping:
         for item in sorted(data[cat_key]):
             sources = tracker.get_sources(item_type, item)
-            print(f"[TRULY MISSING] {item_type}: {item}\n  └─ Demandé par : {sources}")
+            cprint(f"[TRULY MISSING] {item_type}: {item}", C.RED)
+            print(f"  └─ Demandé par : {C.GREY}{sources}{C.RESET}")
 
 def write_csv(data, csv_path):
     tracker = data["tracker"]
@@ -831,7 +991,7 @@ def write_csv(data, csv_path):
         w = csv.writer(f)
         w.writerow(["type", "path", "status", "requested_by"])
         w.writerows(rows)
-    print(f"CSV écrit : {csv_path}")
+    cprint(f"CSV écrit : {csv_path}", C.GREEN)
 
 def main():
     parser = argparse.ArgumentParser(description="Exporte les dépendances d'une map VMF avec suivi de provenance")
@@ -842,26 +1002,40 @@ def main():
     parser.add_argument("-force", action="store_true", help="Ne pas demander de confirmation avant de copier")
     parser.add_argument("-missing", action="store_true", help="Affiche le détail des ressources manquantes avec leur provenance")
     parser.add_argument("-csv", metavar="FICHIER", help="Écrit un rapport CSV détaillé vers ce fichier")
+    parser.add_argument("-Threads", "-threads", dest="threads", type=int, default=1, metavar="NUM",
+                         help="Nombre de threads pour la résolution récursive (I/O disque parallèle -- utile sur les grosses maps). Défaut: 1 (séquentiel)")
+    parser.add_argument("-noColor", action="store_true", help="Désactive la sortie en couleur")
     args = parser.parse_args()
+
+    if args.noColor:
+        os.environ["NO_COLOR"] = "1"
+        C.ON = False
+        for attr in ("RESET", "BOLD", "DIM", "GREEN", "AMBER", "CYAN", "RED", "MAGENTA", "GREY"):
+            setattr(C, attr, "")
+
+    print_banner(args.threads)
 
     vmf_path = Path(args.source)
     if not vmf_path.exists():
-        print(f"Fichier VMF introuvable : {vmf_path}")
+        cprint(f"Fichier VMF introuvable : {vmf_path}", C.RED, bold=True)
         sys.exit(1)
 
     vmf_text = vmf_path.read_text(encoding="utf-8", errors="ignore")
 
-    print("1/2. Indexation du disque dur local...")
+    cprint("[1/3] Indexation du disque dur local...", C.CYAN, bold=True)
     fs = GameFS(args.gameSrc)
     for sub in ("materials", "models", "sound", "particles", "scripts", "lua", "maps", "sprites"):
         fs.index_subtree(sub)
 
-    print("2/2. Indexation des VPK du jeu et des jeux montés...")
+    cprint("[2/3] Indexation des VPK du jeu et des jeux montés...", C.CYAN, bold=True)
     vpk_fs = VPKFS()
     vpk_fs.scan_game_vpks(args.gameSrc)
 
-    print("\nRésolution récursive des dépendances et traçabilité...")
-    data = resolve_all(vmf_text, vmf_path.stem, args.gameSrc, fs, vpk_fs)
+    cprint(f"[3/3] Résolution récursive des dépendances ({args.threads} thread{'s' if args.threads > 1 else ''})...", C.CYAN, bold=True)
+    t0 = time.time()
+    data = resolve_all(vmf_text, vmf_path.stem, args.gameSrc, fs, vpk_fs, threads=args.threads)
+    elapsed = time.time() - t0
+    cprint(f"  Résolution terminée en {elapsed:.1f}s", C.DIM)
 
     print(build_report(data))
 
@@ -875,12 +1049,15 @@ def main():
         return
 
     if not args.force:
-        ans = input("Procéder à l'export ? [Y/N] ")
+        ans = input(f"{C.AMBER}Procéder à l'export ? [Y/N] {C.RESET}")
         if ans.strip().lower() != "y": return
 
-    print("Copie des fichiers locaux en cours...")
-    export_all(data, args.gameSrc, args.dest, fs)
-    print("Export terminé avec succès.")
+    cprint("Copie des fichiers locaux en cours...", C.CYAN)
+    failed = export_all(data, args.gameSrc, args.dest, fs)
+    if failed:
+        cprint(f"Export terminé avec {failed} erreur(s) de copie.", C.AMBER, bold=True)
+    else:
+        cprint("Export terminé avec succès.", C.GREEN, bold=True)
 
 if __name__ == "__main__":
     main()
