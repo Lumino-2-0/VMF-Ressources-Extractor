@@ -53,12 +53,12 @@ cd vmf-resource-extractor
 
 Aucune installation de paquet n'est nécessaire (`pip install` non requis).
 
-## Utilisation
+## Exemples utilisations
 
 ### En ligne de commande
 
 ```bash
-python VMF\_ResExtractor.py -source "chemin/vers/ma\_map.vmf" -gameSrc "C:\\...\\GarrysMod\\garrysmod" -dest ".\\custom" -missing
+python VMF_ResExtractor.py -source "chemin/vers/ma_map.vmf" -gameSrc "C:\...\GarrysMod\garrysmod" -dest ".\custom" -missing
 ```
 
 ### Via le launcher Windows (`.bat`)
