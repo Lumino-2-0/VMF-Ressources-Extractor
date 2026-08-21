@@ -86,7 +86,7 @@ paramètres un par un.
 
 ```
 +--------------------------------------------------------------+
-|                RAPPORT D'EXPORT \& DIAGNOSTIC VPK              |
+|                RAPPORT D'EXPORT \& DIAGNOSTIC VPK            |
 +--------------------------------------------------------------+
 | Materials    : 1508 à copier |  794 en VPK |    1 TRULY MISSING
 | Textures     : 1541 à copier |  187 en VPK |    6 TRULY MISSING
