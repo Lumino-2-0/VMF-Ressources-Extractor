@@ -47,7 +47,7 @@ disque parallélisée).
 ## Installation
 
 ```bash
-git clone <url-du-repo>
+git clone https://github.com/Lumino-2-0/VMF-Ressources-Extractor.git
 cd vmf-resource-extractor
 ```
 
@@ -63,7 +63,7 @@ python VMF\_ResExtractor.py -source "chemin/vers/ma\_map.vmf" -gameSrc "C:\\...\
 
 ### Via le launcher Windows (`.bat`)
 
-Double-cliquer sur `VMF\_ResExtractor\_Launcher.bat` (ou glisser un fichier `.vmf`
+Double-cliquer sur `ResExtractor_Launcher.cmd` (ou glisser un fichier `.vmf`
 directement dessus). Le launcher vérifie que Python est installé, puis demande les
 paramètres un par un.
 
