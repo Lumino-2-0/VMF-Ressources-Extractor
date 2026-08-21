@@ -80,7 +80,6 @@ if not exist "%EXTRACTOR%" (
 
 :: ---------------------------------------------------------------
 :: 4. Questions interactives
-:: (glisser-deposer marche pour les chemins)
 :: ---------------------------------------------------------------
 set "VMF_PATH=%~1"
 if not defined VMF_PATH (
