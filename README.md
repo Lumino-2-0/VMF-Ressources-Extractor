@@ -123,3 +123,9 @@ l'outil ne la signale pas comme `TRULY MISSING`.
 uniquement dans le jeu de base. Ce n'est qu'une supposition :
 son absence n'est jamais signalée comme une erreur.
 
+
+
+
+
+---
+*En coopération avec le magnifiak IronKnight et Mr.Havstrand 🦆🥸*
