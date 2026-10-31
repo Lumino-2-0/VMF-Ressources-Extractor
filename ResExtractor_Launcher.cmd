@@ -68,10 +68,10 @@ echo.
 :: 3. Localisation du script principal
 :: ---------------------------------------------------------------
 set "SCRIPT_DIR=%~dp0"
-set "EXTRACTOR=%SCRIPT_DIR%VMF_ResExtractor.py"
+set "EXTRACTOR=%SCRIPT_DIR%RessourcesExtractor.py"
 
 if not exist "%EXTRACTOR%" (
-    echo [ERREUR] VMF_ResExtractor.py est introuvable a cote de ce launcher.
+    echo [ERREUR] RessourcesExtractor.py est introuvable a cote de ce launcher.
     echo          Attendu : %EXTRACTOR%
     echo.
     pause
